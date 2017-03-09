@@ -87,7 +87,7 @@ class PCL(object):
 
     def rollout(self, max_path_length=None):
         if max_path_length is None:
-            max_path_length = self.env._spec.tags.get(
+            max_path_length = self.env.spec.tags.get(
                     'wrapper_config.TimeLimit.max_episode_steps')
         states = []
         actions = []
