@@ -5,8 +5,8 @@ import numpy as np
 
 class PCL(object):
     def __init__(self, epoch, env, env_spec, replay_buffer, sess=None, net=None,
-            pi_optimizer=None, v_optimizer=None, off_policy_rate=10,
-            pi_lr=7e-4, v_rate=0.5, entropy_tau=0.01, rollout_d=20, gamma=0.99):
+            pi_optimizer=None, v_optimizer=None, off_policy_rate=20,
+            pi_lr=7e-4, v_rate=0.5, entropy_tau=0.5, rollout_d=20, gamma=1):
         self.epoch = epoch
         self.env = env
         self.env_spec = env_spec
@@ -28,62 +28,49 @@ class PCL(object):
 
         self.state_shape = env_spec.get('observation_space').shape
         self.action_shape = [env_spec.get('action_space').n]
+        print('observation space: ', env_spec.get('observation_space'))
+        print('action space: ', env_spec.get('action_space'))
         self.built = False
 
     def build(self):
         pi_model = self.net.pi_model
         v_model = self.net.v_model
-        self.s_t = tf.placeholder(tf.float32, shape=[None, *self.state_shape], name='s_t')
-        self.s_t_d = tf.placeholder(tf.float32, shape=[None, *self.state_shape], name='s_t_d')
-        self.R = tf.placeholder(tf.float32, shape=[None], name='R')
-        self.a = tf.placeholder(tf.float32, shape=[None, *self.action_shape], name='a')
-        self.s = tf.placeholder(tf.float32, shape=[None, *self.state_shape], name='s')
+        self.state = tf.placeholder(tf.float32, shape=[None, None, *self.state_shape], name='state')
+        self.R = tf.placeholder(tf.float32, shape=[None, None], name='R')
+        self.action = tf.placeholder(tf.float32, shape=[None, None, *self.action_shape], name='action')
         self.discount = tf.placeholder(tf.float32, shape=[None], name='discount')
 
-        v_s_t = v_model(self.s_t)
-        v_s_t_d = v_model(self.s_t_d)
-        self.pi = pi_model(self.s)
+        v_s_t = v_model(self.state[:, 0, :])
+        v_s_t_d = v_model(self.state[:, -1, :])
+        self.pi = pi_model(self.state)
         C = K.sum(-v_s_t + self.gamma ** self.rollout_d * v_s_t_d + \
-                K.sum(self.R) - self.entropy_tau * K.sum(self.discount * \
-                K.sum(K.log(self.pi+K.epsilon()) * self.a, axis=-1, keepdims=True)))
+                K.sum(self.R, axis=1) - self.entropy_tau * K.sum(self.discount * \
+                K.sum(K.log(self.pi+K.epsilon()) * self.action, axis=2), axis=1), axis=0)
         self.loss = C ** 2
-        self._grad_pi = K.gradients(self.loss, pi_model.trainable_weights)
-        self._grad_v = K.gradients(self.loss, v_model.trainable_weights)
 
-        self.grad_pi = [tf.placeholder(tf.float32, shape=g.get_shape(), name="grad_pi_{}".format(i)) for i, g in enumerate(self._grad_pi)]
-        self.grad_v = [tf.placeholder(tf.float32, shape=g.get_shape(), name="grad_v_{}".format(i)) for i, g in enumerate(self._grad_v)]
-
-        self.pi_applier = self.pi_optimizer.apply_gradients(
-                [(g, w) for g, w in zip(self.grad_pi, pi_model.trainable_weights)])
-        self.v_applier = self.v_optimizer.apply_gradients(
-                [(g, w) for g, w in zip(self.grad_v, v_model.trainable_weights)])
+        self.updater = [self.pi_optimizer.minimize(self.loss, var_list=pi_model.trainable_weights),
+                self.v_optimizer.minimize(self.loss, var_list=v_model.trainable_weights)]
         self.sess.run(tf.global_variables_initializer())
         self.built = True
 
     def optimize(self, episode):
         if not self.built:
             self.build()
-        grad_pi = [np.zeros(shape=w.get_shape()) for w in self.net.pi_model.trainable_weights]
-        grad_v = [np.zeros(shape=w.get_shape()) for w in self.net.v_model.trainable_weights]
         if len(episode['states']) < self.rollout_d:
             rollout_d = len(episode['states'])
         else:
             rollout_d = self.rollout_d
         discount = np.array([self.gamma**i for i in range(rollout_d)], dtype=np.float32)
+        state = []
+        action = []
+        R = []
         for i in range(len(episode['states'])-rollout_d+1):
-            s_t = [episode['states'][i]]
-            s_t_d = [episode['states'][i+rollout_d-1]]
-            R = episode['rewards'][i:i+rollout_d]
+            state.append(episode['states'][i:i+rollout_d])
             a = episode['actions'][i:i+rollout_d]
-            a = np.eye(*self.action_shape, dtype=np.int32)[a]
-            s = episode['states'][i:i+rollout_d]
-            feed_in = {self.s_t: s_t, self.s_t_d: s_t_d, self.R: R, self.a: a, self.s: s, self.discount: discount}
-            grads = self.sess.run([self._grad_pi, self._grad_v], feed_in)
-            grad_pi = [g_pi+g for g_pi, g in zip(grad_pi, grads[0])]
-            grad_v = [g_v+g for g_v, g in zip(grad_v, grads[1])]
-        feed_grad = {g_pi: g_pi_feed for g_pi, g_pi_feed in zip(self.grad_pi, grad_pi)}
-        feed_grad.update({g_v: g_v_feed for g_v, g_v_feed in zip(self.grad_v, grad_v)})
-        self.sess.run([self.pi_applier, self.v_applier], feed_grad)
+            action.append(np.eye(*self.action_shape, dtype=np.int32)[a])
+            R.append(episode['rewards'][i:i+rollout_d])
+        feed_in = {self.state: state, self.action: action, self.R: R, self.discount: discount}
+        self.sess.run(self.updater, feed_in)
 
     def rollout(self, max_path_length=None):
         if max_path_length is None:
@@ -119,7 +106,7 @@ class PCL(object):
     def get_action(self, state):
         if not self.built:
             self.build()
-        pi = self.sess.run(self.pi, {self.s: [state]})[0]
+        pi = self.sess.run(self.pi, {self.state: [[state]]})[0][0]
         a = np.random.choice(np.arange(self.action_shape[0]), p=pi)
         return a, dict(prob=pi)
 
