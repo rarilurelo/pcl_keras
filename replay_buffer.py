@@ -14,7 +14,7 @@ class ReplayBuffer(object):
         if len(self.buffer) > self.max_len:
             delete_ind = np.random.randint(len(self.buffer))
             del self.buffer[delete_ind]
-            self.wieght = np.delete(self.wieght, delete_ind)
+            self.weight = np.delete(self.weight, delete_ind)
 
     def sample(self):
         return np.random.choice(self.buffer, p=self.weight/self.weight.sum())
